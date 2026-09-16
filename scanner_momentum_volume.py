@@ -1,8 +1,6 @@
 
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-from datetime import datetime
 
 SYMBOL_FIXES = {
     "M&M": "M&M.NS", "MCDOWELL-N": "MCDOWELL-N.NS", "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
@@ -14,13 +12,10 @@ SYMBOL_FIXES = {
 }
 
 def fetch_multi_timeframe(symbol):
-    """Get 1d 15m + 10d daily for volume comparison"""
     ticker_str = SYMBOL_FIXES.get(symbol, f"{symbol}.NS")
     try:
         t = yf.Ticker(ticker_str)
-        # Intraday 15m today
         intraday = t.history(period="5d", interval="15m", timeout=15)
-        # Daily for 10 days volume comparison
         daily = t.history(period="20d", interval="1d", timeout=15)
         if intraday.empty or daily.empty or len(daily) < 6:
             return None, None, ticker_str
@@ -28,34 +23,24 @@ def fetch_multi_timeframe(symbol):
     except:
         return None, None, ticker_str
 
-def momentum_volume_score(symbol):
+def score_symbol(symbol, strict=True):
     intraday, daily, used = fetch_multi_timeframe(symbol)
     if intraday is None or daily is None:
         return None
     
     try:
         ltp = float(intraday['Close'].iloc[-1])
-        if ltp < 25: return None
+        if ltp < 15: return None
         
-        # --- VOLUME ANALYSIS vs Previous Days ---
-        today_vol_so_far = float(intraday['Volume'].iloc[-8:].sum())  # last ~2 hours in 15m
-        # Daily volumes
-        avg_vol_5d = float(daily['Volume'].iloc[-6:-1].mean())  # avg last 5 days (excluding today)
-        avg_vol_10d = float(daily['Volume'].iloc[-11:-1].mean()) # avg last 10 days
-        yesterday_vol = float(daily['Volume'].iloc[-2]) if len(daily) >=2 else avg_vol_5d
-        today_daily_vol = float(daily['Volume'].iloc[-1])  # today's total so far
-        
-        # Volume surge vs previous days - YOUR CORE ASK
+        avg_vol_5d = float(daily['Volume'].iloc[-6:-1].mean())
+        yesterday_vol = float(daily['Volume'].iloc[-2]) if len(daily)>=2 else avg_vol_5d
+        today_daily_vol = float(daily['Volume'].iloc[-1])
         vol_vs_5d_avg = today_daily_vol / (avg_vol_5d + 1)
         vol_vs_yesterday = today_daily_vol / (yesterday_vol + 1)
-        vol_vs_10d_avg = today_daily_vol / (avg_vol_10d + 1)
-        
-        # Intraday volume momentum (is volume increasing now?)
         vol_last_hour = float(intraday['Volume'].iloc[-4:].sum())
         vol_prev_hour = float(intraday['Volume'].iloc[-8:-4].sum())
-        intraday_vol_accel = vol_last_hour / (vol_prev_hour + 1)
+        intraday_vol_accel = vol_last_hour / (vol_prev_hour + 1) if vol_prev_hour>0 else 1
         
-        # --- PRICE MOMENTUM vs Previous Days ---
         prev_close = float(daily['Close'].iloc[-2])
         prev_high = float(daily['High'].iloc[-2])
         five_day_high = float(daily['High'].iloc[-6:-1].max())
@@ -66,11 +51,6 @@ def momentum_volume_score(symbol):
         is_breaking_5d_high = ltp > five_day_high
         is_near_20d_high = ltp >= twenty_day_high * 0.98
         
-        # Consecutive green days momentum
-        daily_returns = daily['Close'].pct_change().iloc[-4:].tolist()  # last 3 days
-        green_days = sum(1 for r in daily_returns if r > 0)
-        
-        # --- VWAP & ORB (intraday structure) ---
         vwap = float((intraday['Close'] * intraday['Volume']).sum() / (intraday['Volume'].sum() + 1))
         today_intraday = intraday[intraday.index.date == intraday.index[-1].date()]
         if len(today_intraday) < 2:
@@ -78,64 +58,72 @@ def momentum_volume_score(symbol):
         or_high = float(today_intraday['High'].iloc[0:2].max())
         or_low = float(today_intraday['Low'].iloc[0:2].min())
         
-        # --- YOUR FILTERS ---
-        # Must have huge volume vs previous days
-        if vol_vs_5d_avg < 1.5:  # at least 1.5x avg volume
-            return None
-        if vol_vs_yesterday < 1.2:  # more than yesterday
-            return None
-        if intraday_vol_accel < 1.1:  # volume accelerating now
-            return None
-        # Must have price momentum
-        if price_vs_prev_close < 0.7:  # at least 0.7% up vs prev close
-            return None
-        if not is_breaking_prev_high:  # breaking yesterday high = momentum
-            return None
-        if ltp < vwap:  # must be above VWAP
-            return None
-        if ltp < or_high:  # must break opening range
-            return None
+        # === FILTERS ===
+        if strict:
+            # TIER 1 - STRICT (High quality)
+            if vol_vs_5d_avg < 1.2: return None
+            if vol_vs_yesterday < 1.0: return None
+            if price_vs_prev_close < 0.5: return None
+            if not is_breaking_prev_high: return None
+            if ltp < vwap: return None
+            if ltp < or_high: return None
+            if intraday_vol_accel < 1.0: return None
+        else:
+            # TIER 2 - RELAXED (Guarantee 1-2 alerts even on dull day)
+            # Only absolutely necessary filters
+            if price_vs_prev_close < 0.15: return None  # at least slightly green
+            if ltp < vwap * 0.998: return None  # allow small dip below VWAP
+            if vol_vs_5d_avg < 0.7: return None  # at least 70% of avg
+            if ltp < 15: return None
         
-        # --- SCORING ---
-        score = 50  # base
-        
-        # Volume scoring (huge weight as you asked)
+        score = 40
+        # Volume
         if vol_vs_5d_avg > 3.0: score += 20
         elif vol_vs_5d_avg > 2.0: score += 15
-        else: score += 8
+        elif vol_vs_5d_avg > 1.2: score += 8
+        else: score += 3
         
         if vol_vs_yesterday > 2.0: score += 10
-        elif vol_vs_yesterday > 1.5: score += 5
+        elif vol_vs_yesterday > 1.3: score += 5
         
-        if intraday_vol_accel > 1.8: score += 10
+        if intraday_vol_accel > 1.5: score += 8
         
-        # Price momentum scoring
+        # Price momentum
         if price_vs_prev_close > 2.0: score += 15
-        elif price_vs_prev_close > 1.2: score += 10
-        else: score += 5
+        elif price_vs_prev_close > 1.0: score += 10
+        elif price_vs_prev_close > 0.5: score += 5
+        else: score += 2
         
-        if is_breaking_5d_high: score += 15
-        elif is_breaking_prev_high: score += 8
+        if is_breaking_5d_high: score += 12
+        elif is_breaking_prev_high: score += 6
         
-        if is_near_20d_high: score += 5
+        if is_near_20d_high: score += 4
         
-        if green_days >= 3: score += 5  # 3 consecutive green days
+        # Tier bonus
+        tier_bonus = 10 if strict else 0
         
-        if score < 80: return None
-        
-        # High RR - tight SL, wide target
-        sl = min(or_low, vwap * 0.997, prev_high * 0.998)
+        sl = min(or_low, vwap * 0.997, prev_high * 0.998) if strict else min(or_low, vwap * 0.995)
         risk = ltp - sl
-        if risk <= 0 or (risk/ltp*100) > 1.2 or (risk/ltp*100) < 0.15:
-            return None
+        if risk <=0: return None
+        risk_pct = risk/ltp*100
+        if strict:
+            if risk_pct > 1.2 or risk_pct < 0.12: return None
+        else:
+            if risk_pct > 2.0 or risk_pct < 0.08: return None
         
-        target = ltp + risk * 3.5  # 3.5R for momentum stocks
+        target = ltp + risk * (3.5 if strict else 2.8)
+        
+        # For relaxed, allow lower score
+        min_score = 75 if strict else 45
+        final_score = score + tier_bonus
+        if final_score < min_score: return None
         
         return {
             "symbol": symbol,
             "used": used,
-            "score": int(min(score, 99)),
-            "setup": "5D High Break + Vol Surge" if is_breaking_5d_high else "Prev High Break + Vol Surge",
+            "score": int(min(final_score, 99)),
+            "tier": "TIER1-STRICT" if strict else "TIER2-RELAXED",
+            "setup": "5D High Break + Vol Surge" if is_breaking_5d_high else "Prev High Break + Vol Surge" if is_breaking_prev_high else "Momentum + Vol",
             "ltp": round(ltp,2),
             "prev_close": round(prev_close,2),
             "price_change_vs_prev": round(price_vs_prev_close,2),
@@ -144,29 +132,48 @@ def momentum_volume_score(symbol):
             "vol_vs_yesterday": round(vol_vs_yesterday,2),
             "vol_accel": round(intraday_vol_accel,2),
             "is_5d_high": is_breaking_5d_high,
-            "green_days": green_days,
+            "is_prev_high": is_breaking_prev_high,
             "vwap_dist": round((ltp-vwap)/vwap*100,2),
             "entry": round(ltp,2),
             "sl": round(sl,2),
             "target": round(target,2),
-            "risk_pct": round(risk/ltp*100,2),
+            "risk_pct": round(risk_pct,2),
             "reward_pct": round((target-ltp)/ltp*100,2),
-            "rr": 3.5
+            "rr": 3.5 if strict else 2.8
         }
     except Exception as e:
-        # print(f"{symbol} error {e}")
         return None
 
 def scan_momentum_volume(universe, max_workers=12):
-    results = []
-    no_data = []
+    """Guarantee 1-2 alerts: Try strict first, fallback to relaxed"""
+    tier1 = []
+    tier2 = []
+    
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        fut = {ex.submit(momentum_volume_score, s): s for s in universe}
-        for f in as_completed(fut):
-            try:
-                res = f.result()
-                if res: results.append(res)
-            except Exception as e:
-                no_data.append(str(e))
-    # Sort by your priority: Volume surge + Price momentum
-    return sorted(results, key=lambda x: (x['vol_vs_5d_avg'] * 2 + x['price_change_vs_prev'] + x['vol_accel']), reverse=True)[:5]
+        # First pass strict
+        fut1 = {ex.submit(score_symbol, s, True): s for s in universe}
+        for f in as_completed(fut1):
+            res = f.result()
+            if res: tier1.append(res)
+    
+    print(f"TIER1 Strict found: {len(tier1)}")
+    
+    if len(tier1) >= 1:
+        # We have at least 1 high quality - return top 5 strict
+        sorted_t1 = sorted(tier1, key=lambda x: (x['vol_vs_5d_avg']*2 + x['price_change_vs_prev'] + x['vol_accel']), reverse=True)
+        return sorted_t1[:5]
+    
+    # No strict found - market dull, fallback to relaxed to guarantee 1-2 alerts
+    print("No TIER1, falling back to TIER2 Relaxed to guarantee 1-2 alerts")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut2 = {ex.submit(score_symbol, s, False): s for s in universe}
+        for f in as_completed(fut2):
+            res = f.result()
+            if res: tier2.append(res)
+    
+    print(f"TIER2 Relaxed found: {len(tier2)}")
+    if tier2:
+        sorted_t2 = sorted(tier2, key=lambda x: (x['score'] + x['vol_vs_5d_avg'] + x['price_change_vs_prev']), reverse=True)
+        return sorted_t2[:5]
+    
+    return []
