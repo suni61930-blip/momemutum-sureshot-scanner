@@ -62,7 +62,7 @@ Why it will rise: Huge volume vs last 5 days + Breaking prev high + Vol accelera
             if "Unauthorized" in r.text:
                 print("BOT_TOKEN wrong")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     from nifty200_list import NIFTY_200
     try:
         from scanner_momentum_volume import scan_momentum_volume
